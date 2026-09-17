@@ -14,6 +14,19 @@ import {
 } from "../usage.js";
 
 const SyntheticQuotasSchema = z.object({
+  rollingFiveHourLimit: z
+    .object({
+      nextTickAt: z.string().datetime({ offset: true }),
+      remaining: z.number().finite().nonnegative(),
+      max: z.number().finite().nonnegative(),
+    })
+    .nullish(),
+  weeklyTokenLimit: z
+    .object({
+      percentRemaining: z.number().finite().min(0).max(100),
+      nextRegenAt: z.string().datetime({ offset: true }).nullish(),
+    })
+    .nullish(),
   subscription: z.object({
     limit: z.number().finite().nonnegative(),
     requests: z.number().finite().nonnegative(),
@@ -132,24 +145,46 @@ export class SyntheticQuotaProvider implements ProviderUsageFetcher {
     } catch {
       throw new SyntheticUsageError("Synthetic returned an invalid quota response");
     }
-    const { requests, limit, renewsAt } = quotas.subscription;
+    const rolling = quotas.rollingFiveHourLimit;
+    const requests = rolling
+      ? Math.max(0, rolling.max - rolling.remaining)
+      : quotas.subscription.requests;
+    const limit = rolling ? rolling.max : quotas.subscription.limit;
+    const hasLegacyReset = !rolling && requests > 0;
+    const resetsAt = hasLegacyReset ? quotas.subscription.renewsAt : null;
     const usedPct = usedPctOf(requests, limit);
+    const fiveHourWindow = windowFromUsedPct({
+      id: "subscription",
+      label: "5 hours",
+      utilizationPct: usedPct,
+      resetsAt,
+      tone: toneFromUsedPct(usedPct),
+    });
+    fiveHourWindow.detail = `${requests} / ${limit} requests`;
+    if (rolling && requests > 0) fiveHourWindow.refillsAt = rolling.nextTickAt;
+    const windows = [fiveHourWindow];
+    if (quotas.weeklyTokenLimit) {
+      const weeklyUsedPct = 100 - quotas.weeklyTokenLimit.percentRemaining;
+      const weeklyWindow = windowFromUsedPct({
+        id: "weekly",
+        label: "Weekly",
+        utilizationPct: weeklyUsedPct,
+        tone: toneFromUsedPct(weeklyUsedPct),
+      });
+      // nextRegenAt marks a partial refill, not a full weekly reset.
+      if (weeklyUsedPct > 0 && quotas.weeklyTokenLimit.nextRegenAt) {
+        weeklyWindow.refillsAt = quotas.weeklyTokenLimit.nextRegenAt;
+      }
+      windows.push(weeklyWindow);
+    }
     return {
       providerId: this.providerId,
       displayName: this.displayName,
       status: "available",
       planLabel: null,
-      windows: [
-        windowFromUsedPct({
-          id: "subscription",
-          label: "Subscription",
-          utilizationPct: usedPct,
-          resetsAt: renewsAt,
-          tone: toneFromUsedPct(usedPct),
-        }),
-      ],
+      windows,
       balances: [],
-      details: [{ id: "requests", label: "Requests", value: `${requests} / ${limit}` }],
+      details: [],
       error: null,
     };
   }

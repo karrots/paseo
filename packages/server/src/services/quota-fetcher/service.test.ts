@@ -1983,7 +1983,8 @@ describe("Synthetic usage", () => {
       windows: [
         {
           id: "subscription",
-          label: "Subscription",
+          label: "5 hours",
+          detail: "25 / 100 requests",
           usedPct: 25,
           remainingPct: 75,
           resetsAt: quota.subscription.renewsAt,
@@ -1991,7 +1992,7 @@ describe("Synthetic usage", () => {
         },
       ],
       balances: [],
-      details: [{ id: "requests", label: "Requests", value: "25 / 100" }],
+      details: [],
       error: null,
     });
     expect(calls).toEqual([
@@ -2098,6 +2099,139 @@ describe("Synthetic usage", () => {
   ])("reports malformed quota responses", async (payload) => {
     process.env["SYNTHETIC_API_KEY"] = "environment";
     response = jsonResponse(payload);
+    expect(await usage()).toMatchObject({
+      status: "error",
+      error: "Synthetic returned an invalid quota response",
+    });
+  });
+  it.each([0, 40, 100])(
+    "shows both windows with %i percent weekly remaining",
+    async (percentRemaining) => {
+      process.env["SYNTHETIC_API_KEY"] = "environment";
+      response = jsonResponse({
+        ...quota,
+        weeklyTokenLimit: {
+          percentRemaining,
+          nextRegenAt: "2026-09-18T00:00:00Z",
+          maxCredits: "100",
+          remainingCredits: "40",
+          nextRegenCredits: "2",
+        },
+      });
+      expect((await usage()).windows).toEqual([
+        expect.objectContaining({
+          id: "subscription",
+          label: "5 hours",
+          usedPct: 25,
+          resetsAt: quota.subscription.renewsAt,
+        }),
+        {
+          id: "weekly",
+          label: "Weekly",
+          usedPct: 100 - percentRemaining,
+          remainingPct: percentRemaining,
+          resetsAt: null,
+          tone: percentRemaining === 0 ? "danger" : "ok",
+          ...(percentRemaining < 100 ? { refillsAt: "2026-09-18T00:00:00Z" } : {}),
+        },
+      ]);
+    },
+  );
+  it.each([undefined, null])(
+    "keeps the five-hour window without weekly quota (%s)",
+    async (weeklyTokenLimit) => {
+      process.env["SYNTHETIC_API_KEY"] = "environment";
+      response = jsonResponse({ ...quota, weeklyTokenLimit });
+      expect((await usage()).windows).toEqual([
+        expect.objectContaining({ id: "subscription", label: "5 hours", usedPct: 25 }),
+      ]);
+    },
+  );
+  it.each([
+    {},
+    { percentRemaining: -1 },
+    { percentRemaining: 101 },
+    { percentRemaining: "50" },
+    { percentRemaining: null },
+  ])("rejects invalid weekly quota (%j)", async (weeklyTokenLimit) => {
+    process.env["SYNTHETIC_API_KEY"] = "environment";
+    response = jsonResponse({ ...quota, weeklyTokenLimit });
+    expect(await usage()).toMatchObject({
+      status: "error",
+      error: "Synthetic returned an invalid quota response",
+    });
+  });
+  it.each([0, 600, 750, 800])(
+    "uses rolling quota over stale subscription with %i remaining",
+    async (remaining) => {
+      process.env["SYNTHETIC_API_KEY"] = "environment";
+      response = jsonResponse({
+        subscription: { ...quota.subscription, requests: 0, limit: 750 },
+        rollingFiveHourLimit: {
+          nextTickAt: "2026-09-18T00:00:00Z",
+          remaining,
+          max: 750,
+          tickPercent: 2,
+          limited: false,
+        },
+      });
+      const result = await usage();
+      const used = Math.max(0, 750 - remaining);
+      expect(result.windows).toEqual([
+        {
+          id: "subscription",
+          label: "5 hours",
+          detail: `${used} / 750 requests`,
+          usedPct: (used / 750) * 100,
+          remainingPct: Math.min(100, (remaining / 750) * 100),
+          resetsAt: null,
+          tone: remaining === 0 ? "danger" : "ok",
+          ...(used > 0 ? { refillsAt: "2026-09-18T00:00:00Z" } : {}),
+        },
+      ]);
+      expect(result.details).toEqual([]);
+    },
+  );
+  it("hides the legacy reset timer when no requests have been used", async () => {
+    process.env["SYNTHETIC_API_KEY"] = "environment";
+    response = jsonResponse({ subscription: { ...quota.subscription, requests: 0 } });
+    expect((await usage()).windows).toEqual([
+      {
+        id: "subscription",
+        label: "5 hours",
+        detail: "0 / 100 requests",
+        usedPct: 0,
+        remainingPct: 100,
+        resetsAt: null,
+        tone: "ok",
+      },
+    ]);
+  });
+  it.each([undefined, null])(
+    "shows weekly quota without a refill time (%s)",
+    async (nextRegenAt) => {
+      process.env["SYNTHETIC_API_KEY"] = "environment";
+      response = jsonResponse({
+        ...quota,
+        weeklyTokenLimit: { percentRemaining: 50, nextRegenAt },
+      });
+      expect((await usage()).windows[1]).toEqual({
+        id: "weekly",
+        label: "Weekly",
+        usedPct: 50,
+        remainingPct: 50,
+        resetsAt: null,
+        tone: "ok",
+      });
+    },
+  );
+  it.each([
+    { remaining: -1, max: 750, nextTickAt: "2026-09-18T00:00:00Z" },
+    { remaining: 1, max: -1, nextTickAt: "2026-09-18T00:00:00Z" },
+    { remaining: 1, max: 750, nextTickAt: "invalid" },
+  ])("rejects invalid rolling quota (%j)", async (rollingFiveHourLimit) => {
+    process.env["SYNTHETIC_API_KEY"] = "environment";
+    response = jsonResponse({ ...quota, rollingFiveHourLimit });
     expect(await usage()).toMatchObject({
       status: "error",
       error: "Synthetic returned an invalid quota response",
