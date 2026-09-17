@@ -63,6 +63,35 @@ export const V2_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
 };
 
+const CATALOG_HYDRATION_TIMEOUT_MS = 15000;
+const CATALOG_HYDRATION_POLL_MS = 200;
+// Measured: a cold server reports the built-in provider roughly a second before the ones from
+// config land, so a shorter window settles on a partial catalog.
+const CATALOG_HYDRATION_STABLE_MS = 1500;
+
+// OpenCode dropped `plugin.awaitActivation`, which used to block server-side until plugin
+// loading settled. Emulate it by polling `plugin.list` until either the target plugin (when
+// given) reaches a terminal state, or, with no target, until the call succeeds once.
+async function awaitPluginActivation(
+  client: Pick<V2Api["plugin"], "list">,
+  location: { directory: string },
+  options: { signal?: AbortSignal; targetId?: string; timeoutMs?: number } = {},
+): Promise<void> {
+  const deadline = Date.now() + (options.timeoutMs ?? 5000);
+  for (;;) {
+    const plugins = await client.list({ location }, { signal: options.signal });
+    if (!options.targetId) return;
+    const target = plugins.data.find((plugin) => plugin.id === options.targetId);
+    if (target?.state.status === "active") return;
+    if (target?.state.status === "failed")
+      throw new Error(
+        `OpenCode v2 plugin "${options.targetId}" failed to activate: ${target.state.error}`,
+      );
+    if (Date.now() >= deadline) return;
+    await delay(150, undefined, { signal: options.signal });
+  }
+}
+
 interface V2AgentOptions {
   logger: Logger;
   settings?: ProviderRuntimeSettings;
@@ -104,18 +133,40 @@ export class OpenCodeV2AgentClient implements AgentClient {
       context ? context.runActivity(name, operation) : operation();
     try {
       await activity("plugin.awaitActivation", () =>
-        connection.client.plugin.awaitActivation({ location }, request),
+        awaitPluginActivation(connection.client.plugin, location, { signal: context?.signal }),
       );
-      const [models, agents, providers] = await Promise.all([
-        activity("model.list", () => connection.client.model.list({ location }, request)),
-        activity("agent.list", () => connection.client.agent.list({ location }, request)),
-        activity("provider.list", () => connection.client.provider.list({ location }, request)),
-      ]);
-      if (!providers.data.length)
-        throw new Error(
-          "OpenCode has no connected providers. Authenticate using opencode auth login.",
-        );
-      return { models: modelsFromV2(models.data), modes: modesFromV2(agents.data) };
+      // OpenCode serves requests before its catalog finishes hydrating, and it fills in stages:
+      // empty, then the built-in provider, then the ones declared in config. Accepting the first
+      // non-empty read therefore caches a partial catalog, so wait for the contents to hold
+      // still. On timeout keep whatever hydrated rather than failing the refresh outright.
+      const deadline = Date.now() + CATALOG_HYDRATION_TIMEOUT_MS;
+      let previous: string | undefined;
+      let unchangedSince = Date.now();
+      for (;;) {
+        const [models, agents, providers] = await Promise.all([
+          activity("model.list", () => connection.client.model.list({ location }, request)),
+          activity("agent.list", () => connection.client.agent.list({ location }, request)),
+          activity("provider.list", () => connection.client.provider.list({ location }, request)),
+        ]);
+        const signature = `${providers.data
+          .map((provider) => provider.id)
+          .sort()
+          .join(",")}|${models.data.length}`;
+        if (signature !== previous) unchangedSince = Date.now();
+        const stable =
+          providers.data.length > 0 &&
+          signature === previous &&
+          Date.now() - unchangedSince >= CATALOG_HYDRATION_STABLE_MS;
+        if (stable || Date.now() >= deadline) {
+          if (!providers.data.length)
+            throw new Error(
+              "OpenCode has no connected providers. Authenticate using opencode auth login.",
+            );
+          return { models: modelsFromV2(models.data), modes: modesFromV2(agents.data) };
+        }
+        previous = signature;
+        await delay(CATALOG_HYDRATION_POLL_MS, undefined, { signal: context?.signal });
+      }
     } finally {
       await connection.release();
     }
@@ -216,7 +267,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     try {
       if (this.options.bridge) {
         const location = { directory: config.cwd };
-        await connection.client.plugin.awaitActivation({ location });
+        await awaitPluginActivation(connection.client.plugin, location, { targetId: "paseo" });
         const plugins = await connection.client.plugin.list({ location });
         if (
           !plugins.data.some((plugin) => plugin.id === "paseo" && plugin.state.status === "active")
@@ -372,7 +423,7 @@ async function commands(client: V2Api, directory: string): Promise<AgentSlashCom
       kind: "command",
     });
   for (const skill of skills.data) {
-    if (skill.slash === false || result.has(skill.id)) continue;
+    if (result.has(skill.id)) continue;
     result.set(skill.id, {
       name: skill.id,
       description: skill.description ?? "",
@@ -459,7 +510,7 @@ export class OpenCodeV2Session implements AgentSession {
       return undefined;
     });
     const location = { directory: this.config.cwd };
-    await this.client.plugin.awaitActivation({ location }, { signal: this.abort.signal });
+    await awaitPluginActivation(this.client.plugin, location, { signal: this.abort.signal });
     if (launch?.env)
       await this.client.session.environment({ sessionID: this.id, variables: launch.env });
     for (const [server, config] of Object.entries(this.config.mcpServers ?? {})) {
@@ -691,7 +742,7 @@ export class OpenCodeV2Session implements AgentSession {
     if (selected && selected.kind !== "skill") {
       await this.client.session.command({
         sessionID: this.id,
-        command: selected.name,
+        name: selected.name,
         text: command?.[2] ?? "",
         files: input.files,
       });
@@ -820,7 +871,7 @@ export class OpenCodeV2Session implements AgentSession {
     const form = this.forms.get(requestId);
     if (form) {
       if (response.behavior === "deny")
-        await this.client.form.cancel({ sessionID: form.sessionID, formID: form.id });
+        await this.client.session.form.cancel({ sessionID: form.sessionID, formID: form.id });
       else {
         const raw = response.updatedInput?.answers;
         const answer: Record<string, FormValue> = {};
@@ -832,14 +883,18 @@ export class OpenCodeV2Session implements AgentSession {
           const normalized = formAnswer(field, value);
           if (normalized !== undefined) answer[field.key] = normalized;
         }
-        await this.client.form.reply({ sessionID: form.sessionID, formID: form.id, answer });
+        await this.client.session.form.reply({
+          sessionID: form.sessionID,
+          formID: form.id,
+          answer,
+        });
       }
       this.forms.delete(requestId);
     } else {
       await this.client.permission.reply({
         sessionID: this.permissionOwners.get(requestId) ?? this.id,
         requestID: requestId,
-        reply: permissionReply(response),
+        decision: permissionReply(response),
       });
     }
     this.resolvePending(requestId, response);
@@ -857,7 +912,7 @@ export class OpenCodeV2Session implements AgentSession {
   private async reconcilePermissions(sessionID: string) {
     const [permissions, forms] = await Promise.all([
       this.client.permission.list({ sessionID }),
-      this.client.form.list({ sessionID }),
+      this.client.session.form.list({ sessionID }),
     ]);
     for (const request of permissions) {
       if (this.pending.has(request.id)) continue;
@@ -997,9 +1052,26 @@ export class OpenCodeV2Session implements AgentSession {
       });
     }
     if (event.type === "session.execution.failed") this.lastError = event.data.error.message;
+    // Deliver text as it arrives instead of waiting for the next snapshot. Structured turns
+    // withhold their text, so only reasoning streams for those.
+    if (event.type === "session.text.delta" && !this.turn?.output)
+      this.emitDelta(event.data, "text");
+    if (event.type === "session.reasoning.delta") this.emitDelta(event.data, "reasoning");
     this.scheduleReconcile();
     if (event.type !== "session.execution.started" || this.turn) return;
     this.observeActiveTurn();
+  }
+  private emitDelta(
+    data: { assistantMessageID: string; ordinal: number; delta: string },
+    kind: "text" | "reasoning",
+  ) {
+    for (const event of this.timeline.delta({
+      messageID: data.assistantMessageID,
+      ordinal: data.ordinal,
+      kind,
+      delta: data.delta,
+    }))
+      this.emitTimeline(event);
   }
   private resolvePending(requestId: string, resolution: AgentPermissionResponse) {
     if (!this.pending.delete(requestId)) return;
