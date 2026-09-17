@@ -1052,9 +1052,26 @@ export class OpenCodeV2Session implements AgentSession {
       });
     }
     if (event.type === "session.execution.failed") this.lastError = event.data.error.message;
+    // Deliver text as it arrives instead of waiting for the next snapshot. Structured turns
+    // withhold their text, so only reasoning streams for those.
+    if (event.type === "session.text.delta" && !this.turn?.output)
+      this.emitDelta(event.data, "text");
+    if (event.type === "session.reasoning.delta") this.emitDelta(event.data, "reasoning");
     this.scheduleReconcile();
     if (event.type !== "session.execution.started" || this.turn) return;
     this.observeActiveTurn();
+  }
+  private emitDelta(
+    data: { assistantMessageID: string; ordinal: number; delta: string },
+    kind: "text" | "reasoning",
+  ) {
+    for (const event of this.timeline.delta({
+      messageID: data.assistantMessageID,
+      ordinal: data.ordinal,
+      kind,
+      delta: data.delta,
+    }))
+      this.emitTimeline(event);
   }
   private resolvePending(requestId: string, resolution: AgentPermissionResponse) {
     if (!this.pending.delete(requestId)) return;

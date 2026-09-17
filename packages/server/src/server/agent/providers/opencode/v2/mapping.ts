@@ -78,11 +78,46 @@ function toolFromV2(tool: SessionMessageAssistantTool): AgentTimelineItem | null
   });
 }
 
+// Delta events number text and reasoning parts separately, so a message holding both reports
+// ordinal 0 twice. Key on the pair to keep the live and snapshot cursors pointing at the same
+// part, matching how OpenCode's own client resolves an ordinal.
+function streamedKey(messageID: string, kind: "text" | "reasoning", ordinal: number) {
+  return `${messageID}:${kind}:${ordinal}`;
+}
+
+function contentKeys(messageID: string, content: readonly { type: string }[]) {
+  const ordinals = new Map<string, number>();
+  return content.map((part, index) => {
+    if (part.type !== "text" && part.type !== "reasoning") return `${messageID}:${index}`;
+    const ordinal = ordinals.get(part.type) ?? 0;
+    ordinals.set(part.type, ordinal + 1);
+    return streamedKey(messageID, part.type, ordinal);
+  });
+}
+
 // Keeps the same cursor for live delivery and reconciliation, so reconnect snapshots emit only missing content.
 export class V2Timeline {
   private readonly content = new Map<string, string>();
 
   constructor(private readonly includeClientMessageId = true) {}
+
+  // Advances the same cursor the snapshot path uses, so a later reconcile sees the streamed
+  // text as already delivered and only emits whatever the deltas missed.
+  delta(input: {
+    messageID: string;
+    ordinal: number;
+    kind: "text" | "reasoning";
+    delta: string;
+  }): AgentStreamEvent[] {
+    if (!input.delta) return [];
+    const key = streamedKey(input.messageID, input.kind, input.ordinal);
+    this.content.set(key, (this.content.get(key) ?? "") + input.delta);
+    const item: AgentTimelineItem =
+      input.kind === "text"
+        ? { type: "assistant_message", text: input.delta, messageId: input.messageID }
+        : { type: "reasoning", text: input.delta };
+    return [{ type: "timeline", provider: "opencode", item, timestamp: new Date().toISOString() }];
+  }
 
   messages(messages: SessionMessageInfo[]): AgentStreamEvent[] {
     const events: AgentStreamEvent[] = [];
@@ -108,8 +143,9 @@ export class V2Timeline {
           });
         }
       } else if (message.type === "assistant") {
-        message.content.forEach((part, ordinal) => {
-          const key = `${message.id}:${ordinal}`;
+        const keys = contentKeys(message.id, message.content);
+        message.content.forEach((part, index) => {
+          const key = keys[index]!;
           const previous = this.content.get(key) ?? "";
           if (part.type === "tool" && part.name === STRUCTURED_OUTPUT_TOOL) {
             if (!structured || accepted || part.state.status !== "completed") return;
