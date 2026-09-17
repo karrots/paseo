@@ -63,6 +63,29 @@ export const V2_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
 };
 
+// OpenCode dropped `plugin.awaitActivation`, which used to block server-side until plugin
+// loading settled. Emulate it by polling `plugin.list` until either the target plugin (when
+// given) reaches a terminal state, or, with no target, until the call succeeds once.
+async function awaitPluginActivation(
+  client: Pick<V2Api["plugin"], "list">,
+  location: { directory: string },
+  options: { signal?: AbortSignal; targetId?: string; timeoutMs?: number } = {},
+): Promise<void> {
+  const deadline = Date.now() + (options.timeoutMs ?? 5000);
+  for (;;) {
+    const plugins = await client.list({ location }, { signal: options.signal });
+    if (!options.targetId) return;
+    const target = plugins.data.find((plugin) => plugin.id === options.targetId);
+    if (target?.state.status === "active") return;
+    if (target?.state.status === "failed")
+      throw new Error(
+        `OpenCode v2 plugin "${options.targetId}" failed to activate: ${target.state.error}`,
+      );
+    if (Date.now() >= deadline) return;
+    await delay(150, undefined, { signal: options.signal });
+  }
+}
+
 interface V2AgentOptions {
   logger: Logger;
   settings?: ProviderRuntimeSettings;
@@ -104,7 +127,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
       context ? context.runActivity(name, operation) : operation();
     try {
       await activity("plugin.awaitActivation", () =>
-        connection.client.plugin.awaitActivation({ location }, request),
+        awaitPluginActivation(connection.client.plugin, location, { signal: context?.signal }),
       );
       const [models, agents, providers] = await Promise.all([
         activity("model.list", () => connection.client.model.list({ location }, request)),
@@ -216,7 +239,7 @@ export class OpenCodeV2AgentClient implements AgentClient {
     try {
       if (this.options.bridge) {
         const location = { directory: config.cwd };
-        await connection.client.plugin.awaitActivation({ location });
+        await awaitPluginActivation(connection.client.plugin, location, { targetId: "paseo" });
         const plugins = await connection.client.plugin.list({ location });
         if (
           !plugins.data.some((plugin) => plugin.id === "paseo" && plugin.state.status === "active")
@@ -372,7 +395,7 @@ async function commands(client: V2Api, directory: string): Promise<AgentSlashCom
       kind: "command",
     });
   for (const skill of skills.data) {
-    if (skill.slash === false || result.has(skill.id)) continue;
+    if (result.has(skill.id)) continue;
     result.set(skill.id, {
       name: skill.id,
       description: skill.description ?? "",
@@ -459,7 +482,7 @@ export class OpenCodeV2Session implements AgentSession {
       return undefined;
     });
     const location = { directory: this.config.cwd };
-    await this.client.plugin.awaitActivation({ location }, { signal: this.abort.signal });
+    await awaitPluginActivation(this.client.plugin, location, { signal: this.abort.signal });
     if (launch?.env)
       await this.client.session.environment({ sessionID: this.id, variables: launch.env });
     for (const [server, config] of Object.entries(this.config.mcpServers ?? {})) {
@@ -691,7 +714,7 @@ export class OpenCodeV2Session implements AgentSession {
     if (selected && selected.kind !== "skill") {
       await this.client.session.command({
         sessionID: this.id,
-        command: selected.name,
+        name: selected.name,
         text: command?.[2] ?? "",
         files: input.files,
       });
@@ -820,7 +843,7 @@ export class OpenCodeV2Session implements AgentSession {
     const form = this.forms.get(requestId);
     if (form) {
       if (response.behavior === "deny")
-        await this.client.form.cancel({ sessionID: form.sessionID, formID: form.id });
+        await this.client.session.form.cancel({ sessionID: form.sessionID, formID: form.id });
       else {
         const raw = response.updatedInput?.answers;
         const answer: Record<string, FormValue> = {};
@@ -832,14 +855,18 @@ export class OpenCodeV2Session implements AgentSession {
           const normalized = formAnswer(field, value);
           if (normalized !== undefined) answer[field.key] = normalized;
         }
-        await this.client.form.reply({ sessionID: form.sessionID, formID: form.id, answer });
+        await this.client.session.form.reply({
+          sessionID: form.sessionID,
+          formID: form.id,
+          answer,
+        });
       }
       this.forms.delete(requestId);
     } else {
       await this.client.permission.reply({
         sessionID: this.permissionOwners.get(requestId) ?? this.id,
         requestID: requestId,
-        reply: permissionReply(response),
+        decision: permissionReply(response),
       });
     }
     this.resolvePending(requestId, response);
@@ -857,7 +884,7 @@ export class OpenCodeV2Session implements AgentSession {
   private async reconcilePermissions(sessionID: string) {
     const [permissions, forms] = await Promise.all([
       this.client.permission.list({ sessionID }),
-      this.client.form.list({ sessionID }),
+      this.client.session.form.list({ sessionID }),
     ]);
     for (const request of permissions) {
       if (this.pending.has(request.id)) continue;
