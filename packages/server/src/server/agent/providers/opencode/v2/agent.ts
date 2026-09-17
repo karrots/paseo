@@ -63,6 +63,12 @@ export const V2_CAPABILITIES: AgentCapabilityFlags = {
   supportsRewindFiles: false,
 };
 
+const CATALOG_HYDRATION_TIMEOUT_MS = 15000;
+const CATALOG_HYDRATION_POLL_MS = 200;
+// Measured: a cold server reports the built-in provider roughly a second before the ones from
+// config land, so a shorter window settles on a partial catalog.
+const CATALOG_HYDRATION_STABLE_MS = 1500;
+
 // OpenCode dropped `plugin.awaitActivation`, which used to block server-side until plugin
 // loading settled. Emulate it by polling `plugin.list` until either the target plugin (when
 // given) reaches a terminal state, or, with no target, until the call succeeds once.
@@ -129,16 +135,38 @@ export class OpenCodeV2AgentClient implements AgentClient {
       await activity("plugin.awaitActivation", () =>
         awaitPluginActivation(connection.client.plugin, location, { signal: context?.signal }),
       );
-      const [models, agents, providers] = await Promise.all([
-        activity("model.list", () => connection.client.model.list({ location }, request)),
-        activity("agent.list", () => connection.client.agent.list({ location }, request)),
-        activity("provider.list", () => connection.client.provider.list({ location }, request)),
-      ]);
-      if (!providers.data.length)
-        throw new Error(
-          "OpenCode has no connected providers. Authenticate using opencode auth login.",
-        );
-      return { models: modelsFromV2(models.data), modes: modesFromV2(agents.data) };
+      // OpenCode serves requests before its catalog finishes hydrating, and it fills in stages:
+      // empty, then the built-in provider, then the ones declared in config. Accepting the first
+      // non-empty read therefore caches a partial catalog, so wait for the contents to hold
+      // still. On timeout keep whatever hydrated rather than failing the refresh outright.
+      const deadline = Date.now() + CATALOG_HYDRATION_TIMEOUT_MS;
+      let previous: string | undefined;
+      let unchangedSince = Date.now();
+      for (;;) {
+        const [models, agents, providers] = await Promise.all([
+          activity("model.list", () => connection.client.model.list({ location }, request)),
+          activity("agent.list", () => connection.client.agent.list({ location }, request)),
+          activity("provider.list", () => connection.client.provider.list({ location }, request)),
+        ]);
+        const signature = `${providers.data
+          .map((provider) => provider.id)
+          .sort()
+          .join(",")}|${models.data.length}`;
+        if (signature !== previous) unchangedSince = Date.now();
+        const stable =
+          providers.data.length > 0 &&
+          signature === previous &&
+          Date.now() - unchangedSince >= CATALOG_HYDRATION_STABLE_MS;
+        if (stable || Date.now() >= deadline) {
+          if (!providers.data.length)
+            throw new Error(
+              "OpenCode has no connected providers. Authenticate using opencode auth login.",
+            );
+          return { models: modelsFromV2(models.data), modes: modesFromV2(agents.data) };
+        }
+        previous = signature;
+        await delay(CATALOG_HYDRATION_POLL_MS, undefined, { signal: context?.signal });
+      }
     } finally {
       await connection.release();
     }
