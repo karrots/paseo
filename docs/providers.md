@@ -197,6 +197,8 @@ Kimi Code usage follows the CLI-managed credential file at `KIMI_CODE_HOME` or `
 
 Cursor usage reads the desktop `state.vscdb` token first, then `cursor-agent`'s `~/.config/cursor/auth.json`. Headless hosts only have the CLI file.
 
+Synthetic usage reads `SYNTHETIC_API_KEY` from the daemon environment, then OpenCode 2's selected Synthetic credential from its SQLite database. It respects `XDG_DATA_HOME` and `OPENCODE_DB`; the default is `~/.local/share/opencode/opencode.db`. Legacy OpenCode `auth.json` is used only when no v2 Synthetic credential exists. An unreadable database or invalid selected credential produces an error rather than switching accounts. Set the environment override on the daemon, not in an agent profile.
+
 ### Usage fetchers are read-only on credentials
 
 A fetcher reads the provider's credential file and never writes it. On a 401 or 403 it returns `unavailable` and leaves refresh to the provider's own CLI: redeeming a refresh token in the fetcher invalidates the CLI's copy (refresh tokens are single-use), and rewriting the file through the fetcher's Zod schema drops any field the schema does not model, corrupting the file for the CLI.
