@@ -5,6 +5,49 @@ import { getServerId } from "../support/helpers/server-id";
 import { openSettingsHostSection } from "../support/helpers/settings";
 
 test.describe("provider usage settings", () => {
+  test("keeps request counts with their window and distinguishes partial refills", async ({
+    page,
+  }, testInfo) => {
+    test.setTimeout(120_000);
+    const nextRefill = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    await installProviderUsageFixture(page, [
+      {
+        fetchedAt: new Date().toISOString(),
+        providers: [
+          {
+            providerId: "synthetic",
+            displayName: "Synthetic",
+            status: "available",
+            planLabel: null,
+            windows: [
+              { id: "subscription", label: "5 hours", usedPct: 0, detail: "0 / 750 requests" },
+              { id: "weekly", label: "Weekly", usedPct: 38, refillsAt: nextRefill },
+            ],
+          },
+        ],
+      },
+    ]);
+    await gotoAppShell(page);
+    await openSettings(page);
+    await openSettingsHostSection(page, getServerId(), "usage");
+    const card = page.getByTestId("provider-usage-card");
+    await expect(card.getByText("0 / 750 requests", { exact: true })).toBeVisible();
+    await expect(card.getByText(/next refill/)).toBeVisible();
+    await expect(card.getByText(/resets/)).toHaveCount(0);
+    const countsY = await card
+      .getByText("0 / 750 requests", { exact: true })
+      .evaluate((element) => element.getBoundingClientRect().y);
+    const weeklyY = await card
+      .getByText("Weekly", { exact: true })
+      .evaluate((element) => element.getBoundingClientRect().y);
+    expect(countsY).toBeLessThan(weeklyY);
+    await page.screenshot({ path: testInfo.outputPath("synthetic-desktop.png") });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(card.getByText("0 / 750 requests", { exact: true })).toBeVisible();
+    await expect(card.getByText(/next refill/)).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath("synthetic-compact.png") });
+  });
+
   test("renders every provider returned by the daemon usage RPC", async ({ page }) => {
     test.setTimeout(120_000);
     const serverId = getServerId();
